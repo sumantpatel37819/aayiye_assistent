@@ -534,6 +534,9 @@ def enrich_state_places(state_name: str, city_name: str = None) -> str:
     if not places:
         return "No places found."
 
+    from agent.task_controller import task_controller
+    task_controller.reset(f"Enriching {state_name}", len(places))
+
     print(f"\n  🗺 {len(places)} places found"
           f"{f' in {city_name}' if city_name else ''} for {state_name}")
           
@@ -548,6 +551,10 @@ def enrich_state_places(state_name: str, city_name: str = None) -> str:
         pname  = place["name"]
         city   = place["city"].replace("_", " ").title()
         state  = state_name
+
+        if not task_controller.check_point(idx, len(places), pname, f"Enriching {state_name}"):
+            print("  ⏹ Task execution stopped.")
+            break
 
         print(f"\n  [{idx}/{len(places)}] Processing: {pname}")
         

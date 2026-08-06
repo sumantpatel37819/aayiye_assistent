@@ -3,3 +3,5 @@ sheet_works
 credentials.json
 scraping_web/raw_html
 AAYIYE
+__pycache__/
+agent/tools/__pycache__/

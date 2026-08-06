@@ -41,11 +41,15 @@ def needs_repair(text: str) -> bool:
 def repair_state_places(state_name: str) -> str:
     """Scans and repairs missing/negative data in the state's Google Sheet."""
     
+    from agent.task_controller import task_controller
+
     print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name}")
     existing_places = get_existing_places_from_sheet(state_name.title())
     
     if not existing_places:
         return f"No existing places found in the sheet for {state_name}."
+
+    task_controller.reset(f"Repairing {state_name}", len(existing_places))
 
     fields_to_check = {
         "Description": "tourist description and importance",
@@ -58,10 +62,11 @@ def repair_state_places(state_name: str) -> str:
     }
     
     repaired_count = 0
+    total_count = len(existing_places)
     
     try:
         # existing_places is a dict: { "place_name_lower": { "row_index": X, "data": [...] } }
-        for place_lower, info in existing_places.items():
+        for idx, (place_lower, info) in enumerate(existing_places.items(), start=1):
             row_idx = info["row_index"]
             row_data = info["data"]
             
@@ -71,6 +76,10 @@ def repair_state_places(state_name: str) -> str:
                 row_dict[col] = row_data[i].strip() if i < len(row_data) else ""
             
             pname = row_dict.get("famous_place_name") or row_dict.get("Place") or place_lower.title()
+
+            if not task_controller.check_point(idx, total_count, pname, f"Repairing {state_name}"):
+                print("  ⏹ Repair task stopped by user.")
+                break
             
             needs_update = False
             

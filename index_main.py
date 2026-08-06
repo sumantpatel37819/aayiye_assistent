@@ -337,4 +337,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ["--cli", "-c", "cli"]:
+        print("🖥️ Starting Aayie in Terminal CLI mode...")
+        asyncio.run(main())
+    else:
+        print("🎨 Launching Aayie Graphical User Interface (GUI)...")
+        from gui_main import AayieGUI
+        app = AayieGUI()
+        app.mainloop()
+

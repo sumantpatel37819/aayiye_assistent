@@ -281,16 +281,16 @@ async def main():
 
             elif intent == "REPAIR_SHEET":
                 print("\n  🛠 Sheet Repair pipeline chal raha hai...")
-                state, _ = extract_enrich_params(user_input)
+                state, city = extract_enrich_params(user_input)
                 if not state:
                     print("Could not understand which state you want to repair. Please specify a state (e.g., 'Bihar ke places repair karo').")
                     continue
                 
-                print(f"  State: {state}")
+                print(f"  State: {state}, City Filter: {city if city else 'All'}")
                 from agent.tools.sheet_repair_tool import repair_state_places
                 
                 try:
-                    result_msg = repair_state_places(state_name=state)
+                    result_msg = repair_state_places(state_name=state, city_name=city)
                     
                     print(f"\n{DIVIDER}")
                     print("  🛠 Repair Result")

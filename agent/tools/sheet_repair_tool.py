@@ -38,18 +38,30 @@ def needs_repair(text: str) -> bool:
             return True
     return False
 
-def repair_state_places(state_name: str) -> str:
-    """Scans and repairs missing/negative data in the state's Google Sheet."""
+def repair_state_places(state_name: str, city_name: str | None = None) -> str:
+    """Scans and repairs missing/negative data in the state's Google Sheet.
+    
+    Args:
+        state_name: State jiska data repair karna hai (e.g., "Bihar").
+        city_name: Agar sirf ek city ka data repair karna ho (e.g., "Patna").
+                   None ya falsy value hone par poore state ka data repair hoga.
+    """
     
     from agent.task_controller import task_controller
 
-    print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name}")
+    city_filter = city_name.strip().lower() if city_name else None
+
+    if city_filter:
+        print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name}, city: {city_name}")
+    else:
+        print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name} (all cities)")
+    
     existing_places = get_existing_places_from_sheet(state_name.title())
     
     if not existing_places:
         return f"No existing places found in the sheet for {state_name}."
 
-    task_controller.reset(f"Repairing {state_name}", len(existing_places))
+    task_controller.reset(f"Repairing {state_name}" + (f" ({city_name})" if city_filter else ""), len(existing_places))
 
     fields_to_check = {
         "Description": "tourist description and importance",
@@ -77,6 +89,12 @@ def repair_state_places(state_name: str) -> str:
             
             pname = row_dict.get("famous_place_name") or row_dict.get("Place") or place_lower.title()
 
+            # ── City filter ───────────────────────────────────
+            if city_filter:
+                row_city = row_dict.get("City", "").strip().lower()
+                if city_filter not in row_city and row_city not in city_filter:
+                    continue  # Is place ka city match nahi kiya — skip karo
+            # ─────────────────────────────────────────────────
             if not task_controller.check_point(idx, total_count, pname, f"Repairing {state_name}"):
                 print("  ⏹ Repair task stopped by user.")
                 break

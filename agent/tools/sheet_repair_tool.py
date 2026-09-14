@@ -78,8 +78,13 @@ def repair_state_places(state_name: str, city_name: str | None = None) -> str:
     
     try:
         # existing_places is a dict: { "place_name_lower": { "row_index": X, "data": [...] } }
+        processed_rows = set()
         for idx, (place_lower, info) in enumerate(existing_places.items(), start=1):
             row_idx = info["row_index"]
+            if row_idx in processed_rows:
+                continue
+            processed_rows.add(row_idx)
+
             row_data = info["data"]
             
             # Reconstruct the row dict for easier manipulation
@@ -91,8 +96,8 @@ def repair_state_places(state_name: str, city_name: str | None = None) -> str:
 
             # ── City filter ───────────────────────────────────
             if city_filter:
-                row_city = row_dict.get("City", "").strip().lower()
-                if city_filter not in row_city and row_city not in city_filter:
+                row_city = (row_dict.get("district") or row_dict.get("Place") or row_dict.get("City") or "").strip().lower()
+                if not (city_filter in row_city or (row_city and row_city in city_filter)):
                     continue  # Is place ka city match nahi kiya — skip karo
             # ─────────────────────────────────────────────────
             if not task_controller.check_point(idx, total_count, pname, f"Repairing {state_name}"):

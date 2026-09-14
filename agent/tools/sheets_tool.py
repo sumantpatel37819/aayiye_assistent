@@ -109,17 +109,24 @@ def get_existing_places_from_sheet(state_name: str) -> dict:
         if not spreadsheet_id:
             return {}
 
-        # Check if sheet exists
+        # Check if sheet exists (case-insensitive)
         sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheets = sheet_metadata.get('sheets', '')
         sheet_names = [sheet['properties']['title'] for sheet in sheets]
         
-        if state_name not in sheet_names:
+        target_tab = None
+        for sname in sheet_names:
+            if sname.strip().lower() == state_name.strip().lower():
+                target_tab = sname
+                break
+
+        if not target_tab:
+            print(f"  ⚠ Tab '{state_name}' not found in Google Sheet. Available tabs: {sheet_names}")
             return {}
 
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{state_name}!A:Q"
+            range=f"{target_tab}!A:Q"
         ).execute()
         
         rows = result.get("values", [])

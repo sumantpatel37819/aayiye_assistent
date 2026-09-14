@@ -5,3 +5,4 @@ scraping_web/raw_html
 AAYIYE
 __pycache__/
 agent/tools/__pycache__/
+playwright_profile/*

@@ -387,6 +387,10 @@ class AayieGUI(tk.Tk):
         lower_input = user_input.lower()
         if "json" in lower_input and ("update" in lower_input or "sync" in lower_input or "karo" in lower_input or "check" in lower_input or "file" in lower_input):
             intent = "SYNC_JSON"
+        elif ("filter" in lower_input or "repair" in lower_input or "fix" in lower_input or "theek" in lower_input or "clean" in lower_input) and ("sheet" in lower_input or "places" in lower_input or "data" in lower_input):
+            intent = "REPAIR_SHEET"
+        elif ("enrich" in lower_input or "daalo" in lower_input or "fill" in lower_input or "bharo" in lower_input) and ("sheet" in lower_input):
+            intent = "ENRICH_SHEET"
         else:
             intent = classify_intent(user_input)
         print(f"  📌 Intent: {intent}")
@@ -443,13 +447,13 @@ class AayieGUI(tk.Tk):
 
         elif intent == "REPAIR_SHEET":
             print("🛠 Sheet Repair pipeline chal raha hai...")
-            state, _ = extract_enrich_params(user_input)
+            state, city = extract_enrich_params(user_input)
             if not state:
                 msg = "Could not understand state to repair. Specify a state (e.g. 'Bihar sheet repair karo')."
                 self.after(0, self._append_chat, "Aayie", msg)
                 return
 
-            res_msg = repair_state_places(state_name=state)
+            res_msg = repair_state_places(state_name=state, city_name=city)
             self.session.add_assistant(str(res_msg))
             self.after(0, self._append_chat, "Aayie", f"Sheet Repair Completed:\n{res_msg}")
 

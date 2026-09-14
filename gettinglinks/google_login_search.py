@@ -9,15 +9,21 @@ Strategy:
   FALLBACK1 → Top web links content (Chrome se hi)
   FALLBACK2 → SerpAPI → AI Overview ya links → requests se text
   FALLBACK3 → DuckDuckGo → links → requests se text
+
+Thread Architecture:
+  Playwright Sync API is bound to a single thread. To avoid thread conflicts,
+  broken pipes, and profile directory locking collisions when called from GUI
+  or sequential loops, a dedicated worker thread manages the browser session.
 """
 
 import os
 import re
 import time
+import queue
 import random
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -28,154 +34,16 @@ SERP_API_KEY   = os.getenv("SERP_API_KEY", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Profile setup
-# Dedicated playwright_profile folder -- blank session kafi hai Google search ke liye
-# Real Chrome cookies copy NAHI karte -- fingerprint mismatch se CAPTCHA aata hai
+# Dedicated playwright_profile folder -- persistent session for cookies
 # ─────────────────────────────────────────────────────────────────────────────
-
-import os as _os
 
 _PW_PROFILE_DIR = str(Path(__file__).resolve().parent.parent / "playwright_profile")
-_os.makedirs(_PW_PROFILE_DIR, exist_ok=True)
-
-# Global playwright/browser objects (singleton)
-_pw        = None
-_browser   = None
-_context   = None
-_page      = None
-
+os.makedirs(_PW_PROFILE_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Browser lifecycle
+# AI Overview Extraction Selectors
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_page():
-    """
-    Ek visible Chrome window kholo (Playwright + stealth).
-    Persistent profile se login session save rehti hai.
-    """
-    global _pw, _browser, _context, _page
-
-    # Already alive check
-    if _page is not None:
-        try:
-            _ = _page.title()  # raises if closed
-            return _page
-        except Exception:
-            _page = _context = _browser = _pw = None
-
-    print("[Browser] Playwright Chromium start ho raha hai...")
-    try:
-        from playwright.sync_api import sync_playwright
-
-        # playwright-stealth: try v2 (Stealth class) then v1 (stealth_sync)
-        try:
-            from playwright_stealth import Stealth
-            _stealth_obj = Stealth()
-            _apply_stealth = lambda pg: _stealth_obj.apply_stealth_sync(pg)
-        except ImportError:
-            try:
-                from playwright_stealth import stealth_sync
-                _apply_stealth = stealth_sync
-            except ImportError:
-                _apply_stealth = lambda pg: None
-
-        _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch_persistent_context(
-            user_data_dir=_PW_PROFILE_DIR,
-            headless=False,
-            args=[
-                "--start-maximized",
-                "--disable-blink-features=AutomationControlled",
-                "--lang=en-IN",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-            viewport={"width": 1280, "height": 900},
-            locale="en-IN",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        _context = _browser
-        _page    = _browser.new_page()
-        _apply_stealth(_page)
-        print("  [OK] Browser ready.")
-    except Exception as e:
-        print(f"  [ERR] Chrome start error: {e}")
-        _pw = _browser = _context = _page = None
-
-    return _page
-
-
-def close_login_driver():
-    """Browser band karo (cleanup)."""
-    global _pw, _browser, _context, _page
-    if _browser is not None:
-        print("[STOP] Chrome browser band ho raha hai...")
-        try:
-            _browser.close()
-        except Exception:
-            pass
-    if _pw is not None:
-        try:
-            _pw.stop()
-        except Exception:
-            pass
-    _page = _context = _browser = _pw = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Google Login (persistent profile hone par usually skip hoga)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ensure_login(page) -> bool:
-    """Google login check karo — agar logged out ho toh login karo."""
-    if not GMAIL_ID or not GMAIL_PASSWORD:
-        print("  ⚠ GMAIL_ID/PASSWORD nahi hai — login skip.")
-        return False
-    try:
-        page.goto("https://accounts.google.com", wait_until="domcontentloaded", timeout=20000)
-        time.sleep(random.uniform(1.5, 3))
-
-        # Already logged in check
-        if page.locator("input[type='email']").count() == 0:
-            print("  [OK] Google mein already logged in hai (persistent profile).")
-            return True
-
-        print("  [LOGIN] Google login ho raha hai...")
-        email_input = page.locator("input[type='email']").first
-        for char in GMAIL_ID:
-            email_input.type(char, delay=random.randint(50, 120))
-        email_input.press("Enter")
-        time.sleep(random.uniform(3, 5))
-
-        pw_input = page.wait_for_selector("input[type='password']", timeout=12000)
-        for char in GMAIL_PASSWORD:
-            pw_input.type(char, delay=random.randint(50, 120))
-        pw_input.press("Enter")
-        time.sleep(random.uniform(5, 8))
-
-        if "accounts.google.com" in page.url:
-            print("  [WARN] CAPTCHA/2FA ho sakta hai -- please browser mein solve karo.")
-            print("  [WAIT] 25 seconds wait ho raha hai...")
-            time.sleep(25)
-
-        print("  [OK] Login complete.")
-        return True
-    except Exception as e:
-        print(f"  [ERR] Login error: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AI Overview Extraction
-# Google ka AI Overview = multiple web sources ka summarized answer
-# CSS selectors frequently change karein — isliye multiple try karte hain
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Updated 2024-2025 selectors (most to least reliable order)
 _AI_SELECTORS = [
     "div.wDYxhc",
     "div.IVvmub",
@@ -196,9 +64,7 @@ def _extract_ai_overview(page) -> str:
     AI Overview asynchronously load hota hai — isliye wait + multi-method.
     """
     print("  [AI] AI Overview dhoondh raha hoon...")
-
-    # AI Overview asynchronously load hota hai -- thoda zyada wait karo
-    time.sleep(random.uniform(5, 7))
+    time.sleep(random.uniform(4.5, 6.0))
 
     found_text = ""
 
@@ -216,7 +82,7 @@ def _extract_ai_overview(page) -> str:
         except Exception:
             continue
 
-    # Method 2: JavaScript — "AI Overview" heading ke baad ka content dhundo
+    # Method 2: JavaScript — "AI Overview" heading ke baad ka container dhundo
     if not found_text:
         try:
             js_text = page.evaluate("""() => {
@@ -232,7 +98,6 @@ def _extract_ai_overview(page) -> str:
                         }
                     }
                 }
-                // Fallback: page ke top area ka text lo (approx first 4000 chars minus nav)
                 const main = document.querySelector('#main, #rso, div[role="main"]');
                 return main ? main.innerText.slice(0, 3000) : '';
             }""")
@@ -264,19 +129,11 @@ def _extract_ai_overview(page) -> str:
     return found_text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Web page text extraction helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _get_result_links(page, max_links: int = 3) -> list:
-    """
-    Google search page se top result links nikalo.
-    JS-based extraction (CSS :has unreliable in headless/playwright).
-    """
+    """Google search page se top result links nikalo."""
     links = []
     try:
-        # JS se directly anchor tags nikalo jo h3 contain karte hain
-        time.sleep(2)  # results render hone ka wait
+        time.sleep(2)
         js_links = page.evaluate("""
             () => {
                 const anchors = document.querySelectorAll('a');
@@ -300,7 +157,7 @@ def _get_result_links(page, max_links: int = 3) -> list:
 
 
 def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
-    """requests + BeautifulSoup se page text nikalo (fast, no browser)."""
+    """requests + BeautifulSoup se page text nikalo."""
     try:
         headers = {
             "User-Agent": (
@@ -313,7 +170,6 @@ def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
         resp = requests.get(url, headers=headers, timeout=12)
         resp.raise_for_status()
 
-        # BeautifulSoup se clean text
         try:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "lxml")
@@ -321,7 +177,6 @@ def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
                 tag.decompose()
             text = soup.get_text(separator="\n", strip=True)
         except ImportError:
-            # Fallback: crude regex strip
             text = re.sub(r"<[^>]+>", " ", resp.text)
             text = re.sub(r"\s+", " ", text).strip()
 
@@ -332,7 +187,7 @@ def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
 
 
 def _fetch_text_browser(page, url: str, max_chars: int = 5000) -> str:
-    """Browser se page text nikalo (agar requests block ho)."""
+    """Browser se page text nikalo."""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=15000)
         time.sleep(random.uniform(2, 3.5))
@@ -344,100 +199,88 @@ def _fetch_text_browser(page, url: str, max_chars: int = 5000) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SerpAPI fallback
+# Login Verification Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _serp_search(query: str, limit: int = 3):
-    """SerpAPI se Google results lo — AI Overview bhi mil sakta hai."""
-    if not SERP_API_KEY:
-        return []
-    try:
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": SERP_API_KEY,
-            "num": limit,
-            "google_domain": "google.com",   # .com for English results
-            "gl": "in",                        # India geolocation
-            "hl": "en",                        # English language
-            "lr": "lang_en",                   # English pages only
-            "safe": "off",
-        }
-        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=15)
-        data = resp.json()
-
-        results = []
-
-        # SerpAPI ka AI Overview check
-        ai = data.get("ai_overview", {})
-        snippets = ai.get("snippets", []) if ai else []
-        if snippets:
-            ai_text = "\n".join(s.get("content", "") for s in snippets if s.get("content"))
-            if len(ai_text) > 100:
-                print(f"  [OK] SerpAPI AI Overview mila -- {len(ai_text)} chars")
-                results.append(("__AI__", ai_text))
-
-        # Organic links
-        for r in data.get("organic_results", []):
-            link = r.get("link")
-            if link:
-                results.append(("link", link))
-
-        return results[:limit + 1]
-    except Exception as e:
-        print(f"  [WARN] SerpAPI error: {e}")
-        return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DuckDuckGo fallback
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ddg_links(query: str, limit: int = 3) -> list:
-    """DuckDuckGo HTML API se links lo (no key, no browser)."""
-    try:
-        # Module ya script dono se import ho sake
-        try:
-            from gettinglinks.duckduckgo import get_duckduckgo_links
-        except ModuleNotFoundError:
-            from duckduckgo import get_duckduckgo_links
-        links = get_duckduckgo_links(query, limit=limit)
-        print(f"  [DDG] DuckDuckGo se {len(links)} links mile.")
-        return links
-    except Exception as e:
-        print(f"  [WARN] DuckDuckGo error: {e}")
-        return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN PUBLIC FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _do_browser_search(query: str, num_results: int) -> str:
+def _is_logged_in_verified(page) -> bool:
     """
-    Actual browser search logic -- thread mein run hoga (asyncio se bahar).
+    Check karta hai ki Google Account genuinely logged in hai ya nahi.
+    False positive na aaye isliye strictly elements + URL check karta hai.
     """
-    page = _get_page()
-    if not page:
-        return ""
+    try:
+        curr_url = (page.url or "").lower()
+        u = urlparse(curr_url)
+        host = (u.hostname or "").lower()
 
+        # 1. Agar accounts.google.com par hai -> Definitely NOT logged in yet
+        if "accounts.google" in host:
+            return False
+
+        # 2. Marketing / informational page -> NOT logged in
+        if "account/about" in curr_url or "accounts.google.com/servicelogin" in curr_url:
+            return False
+
+        # 3. Google search ya home page par check
+        if "google." in host:
+            # Check for logged-in profile avatar
+            profile_count = page.locator(
+                "a[aria-label*='Google Account'], a[aria-label*='Google खाता'], "
+                "a.gb_d, img.gb_d, a[href*='SignOutOptions']"
+            ).count()
+
+            # Check for Sign in button
+            signin_count = page.locator(
+                "a[href*='ServiceLogin'], a[href*='accounts.google.com/signin']"
+            ).count()
+
+            if profile_count > 0 and signin_count == 0:
+                return True
+
+        # 4. myaccount page direct
+        if host == "myaccount.google.com" and "signin" not in curr_url:
+            return True
+
+    except Exception:
+        pass
+    return False
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single Dedicated Browser Worker Thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+_task_queue = queue.Queue()
+_worker_thread = None
+_worker_lock = threading.Lock()
+_login_checked = False
+
+
+def _execute_page_search(page, query: str, num_results: int) -> str:
+    """Page par Google search run karo aur text extract karo."""
     extracted = ""
     try:
         print(f"\n  [SEARCH] Google search: '{query}'")
-
         enc = requests.utils.quote(query)
         page.goto(
             f"https://www.google.com/search?q={enc}&hl=en&gl=in",
-            wait_until="domcontentloaded", timeout=20000
+            wait_until="domcontentloaded",
+            timeout=25000
         )
-        time.sleep(random.uniform(3, 4))
+        time.sleep(random.uniform(2.5, 3.5))
 
         # CAPTCHA check
         if "sorry" in page.url or "captcha" in page.url.lower():
-            print("  [WARN] Google ne CAPTCHA diya! Browser mein solve karo...")
-            time.sleep(60)
-            if "sorry" in page.url:
-                raise Exception("Google CAPTCHA block.")
+            print("\n" + "=" * 65)
+            print("  ⚠️ GOOGLE CAPTCHA DETECTED")
+            print("  👉 Kripya samne browser me CAPTCHA solve kar lijiye...")
+            print("=" * 65)
+            for _ in range(45):
+                time.sleep(2)
+                if "sorry" not in page.url and "captcha" not in page.url.lower():
+                    print("  ✅ CAPTCHA solve ho gaya! Search continue kar rahe hain...")
+                    time.sleep(2)
+                    break
 
         # AI Overview extract karo
         ai_text = _extract_ai_overview(page)
@@ -446,7 +289,7 @@ def _do_browser_search(query: str, num_results: int) -> str:
             extracted += ai_text + "\n"
             extracted += "-------------------------------------------------\n\n"
 
-        # Top links bhi lo
+        # Top web links bhi lo
         links = _get_result_links(page, max_links=num_results)
         print(f"  [LINKS] Google se {len(links)} links mile.")
 
@@ -465,50 +308,310 @@ def _do_browser_search(query: str, num_results: int) -> str:
     return extracted
 
 
+def _find_chrome_path() -> str:
+    possible_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for p in possible_paths:
+        if os.path.exists(p):
+            return p
+    return "chrome"
+
+
+def _launch_native_chrome_login():
+    """
+    Genuine Chrome window open karta hai taaki Google ka
+    'This browser or app may not be secure' error na aaye.
+    User aaram se login karke window band karega.
+    """
+    import subprocess
+    chrome_path = _find_chrome_path()
+    print("\n" + "=" * 74)
+    print("  🔑 GOOGLE ACCOUNT LOGIN SETUP (Sirf 1 baar karna hai)")
+    print("=" * 74)
+    print("  Google automated browsers me direct login block karta hai ('Not secure').")
+    print("  Isliye genuine Google Chrome window open ho rahi hai.")
+    print("  👉 Kripya apna Email, Password aur 2FA daal kar login complete kijiye.")
+    print("  👉 Login complete hone ke baad Chrome window ko CLOSE (band) kar dijiye!")
+    print("=" * 74 + "\n")
+
+    cmd = [
+        chrome_path,
+        f"--user-data-dir={_PW_PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "https://accounts.google.com/signin"
+    ]
+    try:
+        proc = subprocess.Popen(cmd)
+        proc.wait()
+        print("\n  🎉 Chrome window close ho gayi! Session 'playwright_profile' me save ho gaya.\n")
+    except Exception as e:
+        print(f"  [ERR] Native Chrome launch error: {e}")
+
+
+def _browser_worker_loop():
+    """
+    Dedicated worker thread loop.
+    Har Playwright command isi ek thread me run hoti hai.
+    Persistent context open rehta hai across all sheet row repairs.
+    """
+    pw = None
+    browser = None
+    page = None
+
+    def close_all():
+        nonlocal pw, browser, page
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = None
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            browser = None
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            pw = None
+
+    def get_or_create_page(allow_native_login: bool = True):
+        nonlocal pw, browser, page
+        global _login_checked
+        if page is not None:
+            try:
+                _ = page.title()
+                return page
+            except Exception:
+                close_all()
+
+        print("[Browser] Playwright Chromium start ho raha hai...")
+        try:
+            from playwright.sync_api import sync_playwright
+
+            try:
+                from playwright_stealth import Stealth
+                _stealth_obj = Stealth()
+                apply_stealth = lambda pg: _stealth_obj.apply_stealth_sync(pg)
+            except ImportError:
+                try:
+                    from playwright_stealth import stealth_sync
+                    apply_stealth = stealth_sync
+                except ImportError:
+                    apply_stealth = lambda pg: None
+
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch_persistent_context(
+                user_data_dir=_PW_PROFILE_DIR,
+                channel="chrome",
+                headless=False,
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--lang=en-IN",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                viewport={"width": 1280, "height": 900},
+                locale="en-IN",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            page = browser.new_page()
+            apply_stealth(page)
+            print("  [OK] Browser ready.")
+
+            # Login status check
+            if not _login_checked:
+                print("🔍 Checking Google Account login status...")
+                try:
+                    page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=20000)
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+                if _is_logged_in_verified(page):
+                    print("  ✅ [Case 2] Google Account already logged in hai! Seedha Search shuru kar rahe hain...\n")
+                    _login_checked = True
+                elif allow_native_login:
+                    # User not logged in yet -> Close Playwright and open genuine Chrome for 1-time login
+                    close_all()
+                    _launch_native_chrome_login()
+                    _login_checked = True
+                    # Re-open Playwright with the newly saved session
+                    return get_or_create_page(allow_native_login=False)
+                else:
+                    print("  ⚠ Login skip ho gaya. Search continue kar rahe hain...\n")
+                    _login_checked = True
+
+            return page
+        except Exception as e:
+            print(f"  [ERR] Chrome start error: {e}")
+            close_all()
+            return None
+
+    while True:
+        task = _task_queue.get()
+        if task is None:
+            close_all()
+            _task_queue.task_done()
+            break
+
+        cmd, args, result_box, done_event = task
+        try:
+            if cmd == "search":
+                query, num_results = args
+                p = get_or_create_page()
+                if p:
+                    result_box["result"] = _execute_page_search(p, query, num_results)
+                else:
+                    result_box["error"] = "Browser could not be initialized."
+            elif cmd == "close":
+                close_all()
+                result_box["result"] = "closed"
+        except Exception as e:
+            result_box["error"] = str(e)
+        finally:
+            done_event.set()
+            _task_queue.task_done()
+
+
+def _ensure_worker_started():
+    """Worker thread ensure karo ki running hai."""
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = threading.Thread(
+                target=_browser_worker_loop,
+                daemon=True,
+                name="PlaywrightBrowserWorker"
+            )
+            _worker_thread.start()
+
+
+def close_login_driver():
+    """Browser band karo (cleanup)."""
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            print("[STOP] Chrome browser band ho raha hai...")
+            done_event = threading.Event()
+            result_box = {}
+            _task_queue.put(("close", None, result_box, done_event))
+            done_event.wait(timeout=6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SerpAPI fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _serp_search(query: str, limit: int = 3):
+    """SerpAPI se Google results lo."""
+    if not SERP_API_KEY:
+        return []
+    try:
+        params = {
+            "engine": "google",
+            "q": query,
+            "api_key": SERP_API_KEY,
+            "num": limit,
+            "google_domain": "google.com",
+            "gl": "in",
+            "hl": "en",
+            "lr": "lang_en",
+            "safe": "off",
+        }
+        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=15)
+        data = resp.json()
+
+        results = []
+        ai = data.get("ai_overview", {})
+        snippets = ai.get("snippets", []) if ai else []
+        if snippets:
+            ai_text = "\n".join(s.get("content", "") for s in snippets if s.get("content"))
+            if len(ai_text) > 100:
+                print(f"  [OK] SerpAPI AI Overview mila -- {len(ai_text)} chars")
+                results.append(("__AI__", ai_text))
+
+        for r in data.get("organic_results", []):
+            link = r.get("link")
+            if link:
+                results.append(("link", link))
+
+        return results[:limit + 1]
+    except Exception as e:
+        print(f"  [WARN] SerpAPI error: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DuckDuckGo fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ddg_links(query: str, limit: int = 3) -> list:
+    """DuckDuckGo HTML API se links lo."""
+    try:
+        try:
+            from gettinglinks.duckduckgo import get_duckduckgo_links
+        except ModuleNotFoundError:
+            from duckduckgo import get_duckduckgo_links
+        links = get_duckduckgo_links(query, limit=limit)
+        print(f"  [DDG] DuckDuckGo se {len(links)} links mile.")
+        return links
+    except Exception as e:
+        print(f"  [WARN] DuckDuckGo error: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PUBLIC FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def search_and_extract_gemini_and_links(query: str, num_results: int = 2) -> str:
     """
     Search karo aur text extract karo.
 
     Fallback chain:
-      1. Gemini Browser  -> gemini.google.com (NO CAPTCHA, best AI response)
-      2. Google Browser  -> Google AI Overview + web links
-      3. SerpAPI         -> links -> requests se text
-      4. DuckDuckGo      -> links -> requests se text
+      1. Google Browser (Dedicated worker) -> Google AI Overview + web links
+      2. SerpAPI Fallback                  -> links -> requests se text
+      3. DuckDuckGo Fallback               -> links -> requests se text
     """
     extracted = ""
 
-    # -- LAYER 1: Gemini Browser (Primary -- no CAPTCHA) ----------------------
-    print(f"  [Gemini Browser] Searching...")
+    # -- LAYER 1: Google Browser (Live Search + AI Overview) -----------------
+    print(f"\n  🌐 [Live Google Search] Searching with Google AI Overview...")
     try:
-        from gettinglinks.gemini_browser_search import search_with_gemini, close_gemini_browser
-        gemini_text = search_with_gemini(query)
-        if gemini_text and len(gemini_text.strip()) > 80:
-            extracted = "--- Gemini AI Response ---\n" + gemini_text.strip() + "\n--------------------------\n"
+        _ensure_worker_started()
+        done_event = threading.Event()
+        result_box = {"result": "", "error": None}
+        _task_queue.put(("search", (query, num_results), result_box, done_event))
+
+        # First query may need manual login if not logged in (330s max)
+        timeout = 330 if not _login_checked else 75
+        if not done_event.wait(timeout=timeout):
+            print(f"  [WARN] Google browser search timed out ({timeout}s).")
         else:
-            close_gemini_browser()
+            if result_box.get("error"):
+                print(f"  [ERR] Browser error: {result_box['error']}")
+            else:
+                extracted = result_box.get("result", "")
     except Exception as e:
-        print(f"  [WARN] Gemini browser error: {e}")
-        try:
-            from gettinglinks.gemini_browser_search import close_gemini_browser
-            close_gemini_browser()
-        except Exception:
-            pass
+        print(f"  [ERR] Browser runner error: {e}")
 
-    # -- LAYER 2: Google Browser (Fallback) -----------------------------------
+    # -- LAYER 2: SerpAPI Fallback --------------------------------------------
     if not extracted:
-        print("\n  [WARN] Gemini se data nahi mila -- Google browser try kar raha hoon...")
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_do_browser_search, query, num_results)
-                extracted = future.result(timeout=120)
-        except FutureTimeout:
-            print("  [WARN] Google browser timeout (120s).")
-        except Exception as e:
-            print(f"  [ERR] Google browser thread error: {e}")
-
-    # -- LAYER 3: SerpAPI -----------------------------------------------------
-    if not extracted:
-        print("\n  [WARN] Browser se kuch nahi mila -- SerpAPI try kar raha hoon...")
+        print("\n  [WARN] Browser se data nahi mila -- SerpAPI try kar raha hoon...")
         for item_type, item_val in _serp_search(query, limit=num_results):
             if item_type == "__AI__":
                 extracted += "--- SerpAPI AI Overview ---\n" + item_val + "\n---\n\n"
@@ -517,7 +620,7 @@ def search_and_extract_gemini_and_links(query: str, num_results: int = 2) -> str
                 if text:
                     extracted += f"\n--- Source: {item_val} ---\n{text}\n"
 
-    # -- LAYER 4: DuckDuckGo --------------------------------------------------
+    # -- LAYER 3: DuckDuckGo Fallback -----------------------------------------
     if not extracted:
         print("\n  [WARN] SerpAPI bhi fail -- DuckDuckGo try kar raha hoon...")
         for url in _ddg_links(query, limit=num_results):
@@ -531,17 +634,11 @@ def search_and_extract_gemini_and_links(query: str, num_results: int = 2) -> str
     return extracted
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick test
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     result = search_and_extract_gemini_and_links("Golghar Patna Bihar history", num_results=1)
     print("\n" + "=" * 60)
     print(f"TOTAL EXTRACTED: {len(result)} chars")
     print("=" * 60)
-    # ASCII-safe print for Windows terminal
     safe = result[:2000].encode("ascii", errors="replace").decode("ascii")
     print(safe)
     close_login_driver()

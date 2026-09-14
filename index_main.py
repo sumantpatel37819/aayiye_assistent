@@ -98,52 +98,113 @@ Aayie:"""
     return chain.invoke({"history": history_str, "query": query, "context_injection": context_injection}).strip()
 
 
-def extract_enrich_params(query: str) -> tuple[str, str | None]:
-    """Extract State and City (optional) from an ENRICH_SHEET query."""
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_ollama.llms import OllamaLLM
-    import json
-    import re
+# Comprehensive mapping of state names and aliases
+STATE_MAP = {
+    "uttar pradesh": "Uttar Pradesh",
+    "uttarpradesh": "Uttar Pradesh",
+    "u.p.": "Uttar Pradesh",
+    "u.p": "Uttar Pradesh",
+    "up": "Uttar Pradesh",
+    "bihar": "Bihar",
+    "rajasthan": "Rajasthan",
+    "uttarakhand": "Uttarakhand",
+    "u.k.": "Uttarakhand",
+    "uk": "Uttarakhand",
+    "goa": "Goa",
+    "sikkim": "Sikkim",
+    "west bengal": "West Bengal",
+    "bengal": "West Bengal",
+    "wb": "West Bengal",
+    "madhya pradesh": "Madhya Pradesh",
+    "mp": "Madhya Pradesh",
+    "himachal pradesh": "Himachal Pradesh",
+    "himachal": "Himachal Pradesh",
+    "hp": "Himachal Pradesh",
+    "jammu": "Jammu Kashmir",
+    "kashmir": "Jammu Kashmir",
+    "ladakh": "Ladakh",
+    "karnataka": "Karnataka",
+    "kerala": "Kerala",
+    "tamil nadu": "Tamil Nadu",
+    "tamilnadu": "Tamil Nadu",
+    "telangana": "Telangana",
+    "andhra pradesh": "Andhra Pradesh",
+    "andhra": "Andhra Pradesh",
+    "ap": "Andhra Pradesh",
+    "odisha": "Odisha",
+    "orissa": "Odisha",
+    "punjab": "Punjab",
+    "haryana": "Haryana",
+    "chandigarh": "Haryana Chandigarh",
+    "assam": "Assam",
+    "jharkhand": "Jharkhand",
+    "chhattisgarh": "Chhattisgarh",
+    "delhi": "Delhi",
+    "nepal": "Nepal",
+    "bhutan": "Bhutan",
+    "gujarat": "Gujarat",
+    "maharashtra": "Maharashtra",
+}
 
-    model = OllamaLLM(model="llama3.2", keep_alive=-1)
-    prompt = ChatPromptTemplate.from_template(
-        'Extract the state and city (if explicitly mentioned) from this query for a travel database. '
-        'Return ONLY raw JSON with no markdown formatting, no backticks, and no explanation. '
-        'Must have keys "state" and "city". '
-        'CRITICAL: If the user asks for all places in a state (e.g. "saare places", "all places") or does NOT name a specific city, you MUST set city to "all". '
-        'If a specific city is mentioned (e.g. "gaya", "patna"), set city to that exact name.\n'
-        'Query: "{query}"\nJSON:'
-    )
+def extract_enrich_params(query: str) -> tuple[str, str | None]:
+    """Extract State and City (optional) from an ENRICH_SHEET or REPAIR_SHEET query."""
+    import re
+    query_lower = query.lower()
+    
+    # ── Step 1: Deterministic state detection ──────────────
+    detected_state = None
+    # Check multi-word states first (longer to shorter)
+    sorted_state_keys = sorted(STATE_MAP.keys(), key=len, reverse=True)
+    for key in sorted_state_keys:
+        # Match as whole word/phrase
+        pattern = r'\b' + re.escape(key) + r'\b'
+        if re.search(pattern, query_lower):
+            detected_state = STATE_MAP[key]
+            break
+            
+    # ── Step 2: Extract city if explicitly present in query ─
+    detected_city = None
+    # Call LLM only if query could contain a specific city
     try:
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_ollama.llms import OllamaLLM
+        import json
+
+        model = OllamaLLM(model="llama3.2", keep_alive=-1)
+        prompt = ChatPromptTemplate.from_template(
+            'User query: "{query}"\n'
+            'Analyze if a SPECIFIC CITY or DISTRICT name is EXPLICITLY written in the user query above.\n'
+            'Rules:\n'
+            '- If a specific city or district is mentioned (e.g. Varanasi, Lucknow, Agra, Patna, Gaya), extract it.\n'
+            '- If the user asks for the whole state, mentions no city, or says "all", return "all".\n'
+            '- Return ONLY raw JSON: {{"state": "...", "city": "..."}}\n'
+            'JSON:'
+        )
         res = (prompt | model).invoke({"query": query}).strip()
-        
-        # Clean markdown code blocks if any (fallback)
         if "```json" in res:
             res = res.split("```json")[1].split("```")[0].strip()
         elif "```" in res:
             res = res.split("```")[1].split("```")[0].strip()
-            
-        # Try to find a JSON object using regex if there's surrounding text
         match = re.search(r'\{.*\}', res, re.DOTALL)
         if match:
-            res = match.group(0)
+            data = json.loads(match.group(0))
+            if not detected_state and data.get("state"):
+                llm_state = data.get("state", "").strip()
+                detected_state = STATE_MAP.get(llm_state.lower(), llm_state)
             
-        data = json.loads(res)
-        state = data.get("state")
-        city = data.get("city")
-        if isinstance(city, str) and city.lower() in ["null", "none", "", "n/a", "all", "any"]:
-            city = None
-        return state, city
+            raw_city = data.get("city")
+            if isinstance(raw_city, str):
+                raw_city_clean = raw_city.strip()
+                if raw_city_clean.lower() not in ["null", "none", "", "n/a", "all", "any"]:
+                    # Sanity check: verify city is ACTUALLY in the query text to prevent hallucination
+                    if raw_city_clean.lower() in query_lower:
+                        detected_city = raw_city_clean
+                    else:
+                        print(f"  ℹ Ignored LLM hallucinated city '{raw_city_clean}' (not mentioned in query).")
     except Exception as e:
-        print(f"Error extracting params: {e}")
-        # Very simple fallback using string matching if LLM fails
-        query_lower = query.lower()
-        if "bihar" in query_lower: return "Bihar", "Nalanda" if "nalanda" in query_lower else ("Kaimur" if "kaimur" in query_lower else None)
-        if "goa" in query_lower: return "Goa", None
-        if "rajasthan" in query_lower: return "Rajasthan", None
-        if "nepal" in query_lower: return "Nepal", None
-        if "bhutan" in query_lower: return "Bhutan", None
-        return None, None
+        print(f"Error extracting params with LLM: {e}")
+
+    return detected_state, detected_city
 
 
 # ─────────────────────────────────────────────
@@ -189,6 +250,10 @@ async def main():
         lower_input = user_input.lower()
         if "json" in lower_input and ("update" in lower_input or "sync" in lower_input or "karo" in lower_input or "check" in lower_input or "file" in lower_input):
             intent = "SYNC_JSON"
+        elif ("filter" in lower_input or "repair" in lower_input or "fix" in lower_input or "theek" in lower_input or "clean" in lower_input) and ("sheet" in lower_input or "places" in lower_input or "data" in lower_input):
+            intent = "REPAIR_SHEET"
+        elif ("enrich" in lower_input or "daalo" in lower_input or "fill" in lower_input or "bharo" in lower_input) and ("sheet" in lower_input):
+            intent = "ENRICH_SHEET"
         else:
             intent = classify_intent(user_input)
         print(f"  📌 Intent: {intent}")

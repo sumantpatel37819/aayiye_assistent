@@ -250,6 +250,12 @@ async def main():
         lower_input = user_input.lower()
         if "json" in lower_input and ("update" in lower_input or "sync" in lower_input or "karo" in lower_input or "check" in lower_input or "file" in lower_input):
             intent = "SYNC_JSON"
+        elif "pinecone" in lower_input and ("push" in lower_input or "sync" in lower_input or "embed" in lower_input or "daalo" in lower_input or "upload" in lower_input):
+            intent = "PUSH_PINECONE"
+        elif "csv" in lower_input and ("repair" in lower_input or "fix" in lower_input or "theek" in lower_input or "missing" in lower_input or "clean" in lower_input):
+            intent = "REPAIR_CSV"
+        elif "csv" in lower_input and ("create" in lower_input or "banao" in lower_input or "generate" in lower_input or "file" in lower_input or "karo" in lower_input or "save" in lower_input):
+            intent = "CREATE_CSV"
         elif ("filter" in lower_input or "repair" in lower_input or "fix" in lower_input or "theek" in lower_input or "clean" in lower_input) and ("sheet" in lower_input or "places" in lower_input or "data" in lower_input):
             intent = "REPAIR_SHEET"
         elif ("enrich" in lower_input or "daalo" in lower_input or "fill" in lower_input or "bharo" in lower_input) and ("sheet" in lower_input):
@@ -366,6 +372,64 @@ async def main():
                 except Exception as e:
                     print(f"Error during sheet repair: {e}")
 
+            elif intent == "CREATE_CSV":
+                print("\n  📄 State Places CSV Creation pipeline chal raha hai...")
+                state, city = extract_enrich_params(user_input)
+                if not state:
+                    print("Could not understand which state you want to create CSV for. Please specify a state (e.g., 'Bihar ka csv file create karo').")
+                    continue
+                
+                print(f"  State: {state}, City Filter: {city if city else 'All'}")
+                from agent.tools.create_csv_tool import create_state_csv
+                
+                try:
+                    result_msg = create_state_csv(state_name=state, city_filter=city)
+                    print(f"\n{DIVIDER}")
+                    print("  📄 Create CSV Result")
+                    print(DIVIDER)
+                    print(result_msg)
+                    print(DIVIDER)
+                    session.add_assistant(f"Created CSV for {state}.")
+                except Exception as e:
+                    print(f"Error during CSV creation: {e}")
+
+            elif intent == "REPAIR_CSV":
+                print("\n  🛠 State Places CSV Repair pipeline chal raha hai...")
+                state, city = extract_enrich_params(user_input)
+                if not state:
+                    state = "Bihar"
+                
+                print(f"  State: {state}, City Filter: {city if city else 'All'}")
+                from agent.tools.repair_csv_tool import repair_state_csv
+                try:
+                    result_msg = repair_state_csv(state_name=state, city_filter=city)
+                    print(f"\n{DIVIDER}")
+                    print("  🛠 Repair CSV Result")
+                    print(DIVIDER)
+                    print(result_msg)
+                    print(DIVIDER)
+                    session.add_assistant(f"Repaired CSV for {state}.")
+                except Exception as e:
+                    print(f"Error during CSV repair: {e}")
+
+            elif intent == "PUSH_PINECONE":
+                print("\n  🌲 State Places Pinecone Vector Sync pipeline chal raha hai...")
+                state, _ = extract_enrich_params(user_input)
+                if not state:
+                    state = "Bihar"
+
+                from agent.tools.pinecone_sync_tool import push_state_csv_to_pinecone
+                try:
+                    result_msg = push_state_csv_to_pinecone(state_name=state)
+                    print(f"\n{DIVIDER}")
+                    print("  🌲 Pinecone Sync Result")
+                    print(DIVIDER)
+                    print(result_msg)
+                    print(DIVIDER)
+                    session.add_assistant(f"Synced {state} places to Pinecone.")
+                except Exception as e:
+                    print(f"Error during Pinecone sync: {e}")
+
             elif intent == "SYNC_JSON":
                 print("\n  🔄 JSON files synchronising & updating...")
                 from agent.tools.json_sync_tool import run_json_sync
@@ -402,7 +466,30 @@ async def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ["--cli", "-c", "cli"]:
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ["--create-csv", "-csv", "--csv", "csv"]:
+        state_arg = sys.argv[2] if len(sys.argv) > 2 else "Bihar"
+        print(f"📄 Running State CSV Creation directly from CLI for: {state_arg}...")
+        from agent.tools.create_csv_tool import create_state_csv
+        create_state_csv(state_arg)
+    elif len(sys.argv) > 1 and sys.argv[1].lower() in ["--repair-csv", "-rcsv", "repair-csv"]:
+        state_arg = sys.argv[2] if len(sys.argv) > 2 else "Bihar"
+        print(f"🛠 Running State CSV Repair directly from CLI for: {state_arg}...")
+        from agent.tools.repair_csv_tool import repair_state_csv
+        repair_state_csv(state_arg)
+    elif len(sys.argv) > 1 and sys.argv[1].lower() in ["--push-pinecone", "-pinecone", "--pinecone"]:
+        state_arg = sys.argv[2] if len(sys.argv) > 2 else "Bihar"
+        print(f"🌲 Running State Places Pinecone Sync directly from CLI for: {state_arg}...")
+        from agent.tools.pinecone_sync_tool import push_state_csv_to_pinecone
+        push_state_csv_to_pinecone(state_arg)
+    elif len(sys.argv) > 1 and sys.argv[1].lower() in ["--test-rag", "-rag", "--rag"]:
+        query_arg = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else "Golghar Patna ka ticket pricing aur best time kya hai?"
+        print(f"🌲 Running Tour RAG Test directly from CLI for query: '{query_arg}'...")
+        from agent.services.tour_rag_service import query_tour_rag, format_rag_response_for_chat
+        rag_res = query_tour_rag(query_arg)
+        print("\n" + "=" * 60)
+        print(format_rag_response_for_chat(rag_res))
+        print("=" * 60)
+    elif len(sys.argv) > 1 and sys.argv[1].lower() in ["--cli", "-c", "cli"]:
         print("🖥️ Starting Aayie in Terminal CLI mode...")
         asyncio.run(main())
     else:

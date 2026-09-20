@@ -130,7 +130,7 @@ def _extract_ai_overview(page) -> str:
 
 
 def _get_result_links(page, max_links: int = 3) -> list:
-    """Google search page se top result links nikalo."""
+    """Google search page se top result links nikalo, excluding blocked/social/heavy domains."""
     links = []
     try:
         time.sleep(2)
@@ -138,12 +138,18 @@ def _get_result_links(page, max_links: int = 3) -> list:
             () => {
                 const anchors = document.querySelectorAll('a');
                 const results = [];
+                const blockedDomains = [
+                    'google.', 'tripadvisor.', 'facebook.com', 'instagram.com',
+                    'twitter.com', 'x.com', 'linkedin.com', 'pinterest.com',
+                    'youtube.com', 'maps.google'
+                ];
                 for (const a of anchors) {
-                    if (a.querySelector('h3') && a.href &&
-                        !a.href.includes('google.com') &&
-                        a.href.startsWith('http') &&
-                        !results.includes(a.href)) {
-                        results.push(a.href);
+                    if (a.querySelector('h3') && a.href && a.href.startsWith('http')) {
+                        const hrefLower = a.href.toLowerCase();
+                        const isBlocked = blockedDomains.some(d => hrefLower.includes(d));
+                        if (!isBlocked && !results.includes(a.href)) {
+                            results.push(a.href);
+                        }
                     }
                     if (results.length >= 5) break;
                 }
@@ -159,6 +165,14 @@ def _get_result_links(page, max_links: int = 3) -> list:
 def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
     """requests + BeautifulSoup se page text nikalo."""
     try:
+        domain = urlparse(url).netloc.lower()
+        blocked_domains = [
+            "tripadvisor.", "facebook.com", "instagram.com",
+            "twitter.com", "x.com", "youtube.com", "linkedin.com", "pinterest.com"
+        ]
+        if any(b in domain for b in blocked_domains):
+            return ""
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -167,7 +181,7 @@ def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
             ),
             "Accept-Language": "en-IN,en;q=0.9",
         }
-        resp = requests.get(url, headers=headers, timeout=12)
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
 
         try:
@@ -189,7 +203,15 @@ def _fetch_text_requests(url: str, max_chars: int = 5000) -> str:
 def _fetch_text_browser(page, url: str, max_chars: int = 5000) -> str:
     """Browser se page text nikalo."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        domain = urlparse(url).netloc.lower()
+        blocked_domains = [
+            "tripadvisor.", "facebook.com", "instagram.com",
+            "twitter.com", "x.com", "youtube.com", "linkedin.com", "pinterest.com"
+        ]
+        if any(b in domain for b in blocked_domains):
+            return ""
+
+        page.goto(url, wait_until="domcontentloaded", timeout=12000)
         time.sleep(random.uniform(2, 3.5))
         text = page.evaluate("document.body.innerText")
         return (text or "")[:max_chars]
@@ -256,9 +278,27 @@ _worker_lock = threading.Lock()
 _login_checked = False
 
 
-def _execute_page_search(page, query: str, num_results: int) -> str:
-    """Page par Google search run karo aur text extract karo."""
+def _is_captcha_page(page) -> bool:
+    """Detect if the current page is a Google CAPTCHA or 'sorry' page."""
+    try:
+        url_lower = (page.url or "").lower()
+        if "sorry" in url_lower or "captcha" in url_lower:
+            return True
+        title_lower = (page.title() or "").lower()
+        if "unusual traffic" in title_lower or "captcha" in title_lower:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _execute_page_search(page, query: str, num_results: int) -> tuple[str, bool]:
+    """
+    Page par Google search run karo aur text extract karo.
+    Returns: (extracted_text, had_captcha_timeout)
+    """
     extracted = ""
+    had_captcha_timeout = False
     try:
         print(f"\n  [SEARCH] Google search: '{query}'")
         enc = requests.utils.quote(query)
@@ -270,17 +310,23 @@ def _execute_page_search(page, query: str, num_results: int) -> str:
         time.sleep(random.uniform(2.5, 3.5))
 
         # CAPTCHA check
-        if "sorry" in page.url or "captcha" in page.url.lower():
+        if _is_captcha_page(page):
             print("\n" + "=" * 65)
             print("  ⚠️ GOOGLE CAPTCHA DETECTED")
-            print("  👉 Kripya samne browser me CAPTCHA solve kar lijiye...")
+            print("  👉 Agar aap chahein toh 10s me solve kar sakte hain, warna automatic skip ho jayega...")
             print("=" * 65)
-            for _ in range(45):
+            captcha_solved = False
+            for _ in range(5):  # 5 * 2s = 10 seconds max
                 time.sleep(2)
-                if "sorry" not in page.url and "captcha" not in page.url.lower():
+                if not _is_captcha_page(page):
                     print("  ✅ CAPTCHA solve ho gaya! Search continue kar rahe hain...")
-                    time.sleep(2)
+                    captcha_solved = True
+                    time.sleep(1.5)
                     break
+
+            if not captcha_solved:
+                print("  ⏩ CAPTCHA 10s me solve nahi hua. Browser session reset karenge aur fallback par move karenge...\n")
+                return "", True
 
         # AI Overview extract karo
         ai_text = _extract_ai_overview(page)
@@ -305,7 +351,7 @@ def _execute_page_search(page, query: str, num_results: int) -> str:
     except Exception as e:
         print(f"  [ERR] Browser search error: {e}")
 
-    return extracted
+    return extracted, False
 
 
 def _find_chrome_path() -> str:
@@ -356,11 +402,13 @@ def _browser_worker_loop():
     """
     Dedicated worker thread loop.
     Har Playwright command isi ek thread me run hoti hai.
-    Persistent context open rehta hai across all sheet row repairs.
+    Persistent context open rehta hai across all sheet row repairs / place searches.
+    Includes proactive session recycling (every 8 searches) and reactive CAPTCHA reset.
     """
     pw = None
     browser = None
     page = None
+    searches_since_recycle = 0
 
     def close_all():
         nonlocal pw, browser, page
@@ -472,13 +520,33 @@ def _browser_worker_loop():
         try:
             if cmd == "search":
                 query, num_results = args
+
+                # --- PROACTIVE SESSION RECYCLING ---
+                # Google rate-limits automated rapid requests (~8-10 searches).
+                # Re-cycling the browser clears socket connections and temporary bot scoring.
+                if searches_since_recycle >= 8:
+                    print(f"\n🔄 [Session Recycle] {searches_since_recycle} searches complete. Closing browser session to avoid rate limits & refreshing...")
+                    close_all()
+                    time.sleep(random.uniform(4.0, 6.0))
+                    searches_since_recycle = 0
+
                 p = get_or_create_page()
                 if p:
-                    result_box["result"] = _execute_page_search(p, query, num_results)
+                    search_res, had_captcha_timeout = _execute_page_search(p, query, num_results)
+                    result_box["result"] = search_res
+
+                    if had_captcha_timeout:
+                        print("🛑 [Browser Reset] CAPTCHA detected on Google. Closing browser immediately so next search starts clean...")
+                        close_all()
+                        time.sleep(random.uniform(4.0, 6.0))
+                        searches_since_recycle = 0
+                    else:
+                        searches_since_recycle += 1
                 else:
                     result_box["error"] = "Browser could not be initialized."
             elif cmd == "close":
                 close_all()
+                searches_since_recycle = 0
                 result_box["result"] = "closed"
         except Exception as e:
             result_box["error"] = str(e)

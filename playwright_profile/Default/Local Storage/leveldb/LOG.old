@@ -1,3 +1,8 @@
-2026/09/13-23:21:15.874 25a0 Reusing MANIFEST E:\ML_Projects\aayie_chatbot\playwright_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/13-23:21:15.890 25a0 Recovering log #4
-2026/09/13-23:21:15.893 25a0 Reusing old log E:\ML_Projects\aayie_chatbot\playwright_profile\Default\Local Storage\leveldb/000004.log 
+2026/09/15-22:02:02.074 4e70 Reusing MANIFEST E:\ML_Projects\aayie_chatbot\playwright_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/15-22:02:02.082 4e70 Recovering log #193
+2026/09/15-22:02:02.083 4e70 Reusing old log E:\ML_Projects\aayie_chatbot\playwright_profile\Default\Local Storage\leveldb/000193.log 
+2026/09/15-22:04:03.090 6f44 Level-0 table #198: started
+2026/09/15-22:04:03.094 6f44 Level-0 table #198: 38399 bytes OK
+2026/09/15-22:04:03.095 6f44 Delete type=0 #193
+2026/09/15-22:06:38.792 4e70 Level-0 table #200: started
+2026/09/15-22:06:38.799 4e70 Level-0 table #200: 55902 bytes OK

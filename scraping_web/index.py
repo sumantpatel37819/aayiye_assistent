@@ -28,17 +28,16 @@ async def run_query(query: str, num_results: int = 2):
     print(f"  Query: {query}")
     print(f"{'='*50}")
 
-    from gettinglinks.selenium_search import search_and_extract_text
+    from gettinglinks.google_login_search import search_and_extract_gemini_and_links
     
-    # Run the synchronous selenium scraper in a background thread so UI/async loop doesn't block
-    results = await asyncio.to_thread(search_and_extract_text, query, num_results)
+    raw_text = await asyncio.to_thread(search_and_extract_gemini_and_links, query, num_results)
     
-    if not results:
-        print("❌ Koi data scrape nahi ho paaya Selenium se.")
+    if not raw_text:
+        print("❌ Koi data scrape nahi ho paaya.")
         return []
 
-    print(f"\n✅ {len(results)} pages se raw data mil gaya (Ab LLM isko refine karega).")
-    return results
+    print(f"\n✅ Data extract ho gaya (Ab LLM isko refine karega).")
+    return [(raw_text, [])]
 
 
 if __name__ == "__main__":

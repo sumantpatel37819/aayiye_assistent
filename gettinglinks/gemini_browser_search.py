@@ -13,6 +13,7 @@ Note: ThreadPoolExecutor mein run hota hai (asyncio compatible).
 """
 
 import os
+from gettinglinks.chrome_config import find_chrome, assistant_profile_dir
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 # Profile setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PW_PROFILE_DIR = str(Path(__file__).resolve().parent.parent / "playwright_profile")
+_PW_PROFILE_DIR = str(assistant_profile_dir())
 os.makedirs(_PW_PROFILE_DIR, exist_ok=True)
 
 GEMINI_URL = "https://gemini.google.com/app"
@@ -60,6 +61,7 @@ def _get_page():
         _pw = sync_playwright().start()
         _browser = _pw.chromium.launch_persistent_context(
             user_data_dir=_PW_PROFILE_DIR,
+            executable_path=find_chrome(),
             headless=False,
             args=[
                 "--start-maximized",

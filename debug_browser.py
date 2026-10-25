@@ -2,14 +2,16 @@
 Debug script — search ke baad page screenshot lo
 """
 import sys, time, random
-sys.path.insert(0, '.')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gettinglinks.chrome_config import find_chrome, chrome_user_data_dir, assistant_profile_dir
 
 from playwright.sync_api import sync_playwright
 
 # Cookie sync
 import os, shutil
-REAL_CHROME = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
-PW_PROFILE  = os.path.join(os.path.dirname(__file__), "playwright_profile")
+REAL_CHROME = str(chrome_user_data_dir())
+PW_PROFILE  = str(assistant_profile_dir())
 os.makedirs(os.path.join(PW_PROFILE, "Default", "Network"), exist_ok=True)
 
 for src, dst in [
@@ -25,6 +27,9 @@ for src, dst in [
             f.write(data)
         print(f"Copied: {os.path.basename(src)}")
     except PermissionError:
+        if sys.platform != "win32":
+            print(f"SKIP (permission denied): {src}")
+            continue
         import ctypes, ctypes.wintypes
         handle = ctypes.windll.kernel32.CreateFileW(
             src, 0x80000000, 0x00000001 | 0x00000002, None, 3, 0, None)
@@ -43,6 +48,7 @@ for src, dst in [
 pw = sync_playwright().start()
 br = pw.chromium.launch_persistent_context(
     user_data_dir=PW_PROFILE,
+    executable_path=find_chrome(),
     headless=False,
     args=["--start-maximized", "--disable-blink-features=AutomationControlled", "--no-first-run"],
     viewport={"width": 1280, "height": 900},

@@ -1,0 +1,29 @@
+# Core LangChain & Ollama
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+langchain-text-splitters>=0.3.0
+
+# Vector Databases & Search
+pinecone-client>=5.0.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0
+
+# Google APIs (Sheets & Places)
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.2.0
+
+# Web Scraping & Automation
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+trafilatura>=1.6.0
+fake-useragent>=1.4.0
+selenium>=4.20.0
+undetected-chromedriver>=3.5.5
+playwright>=1.43.0
+playwright-stealth>=1.0.6
+
+# System & Utilities
+python-dotenv>=1.0.0
+pyautogui>=0.9.54
+crawl4ai>=0.9.0

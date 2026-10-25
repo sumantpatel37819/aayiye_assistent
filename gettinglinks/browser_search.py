@@ -4,6 +4,8 @@ query search karo aur top search result links lo.
 
 No API key needed — DuckDuckGo pe CAPTCHA nahi aate.
 """
+from gettinglinks.chrome_config import find_chrome, chrome_major_version
+
 
 import asyncio
 from playwright.async_api import async_playwright
@@ -93,7 +95,7 @@ options = webdriver.ChromeOptions()
 # options.add_argument(r"--user-data-dir=C:/Users/hacke/AppData/Local/Google/Chrome/User Data")  # Apne Chrome user data path se replace karo
 # options.add_argument("--profile-directory=Default")  # Apne Chrome profile directory se replace karo
 
-driver = webdriver.Chrome(options=options, use_subprocess=True)
+driver = webdriver.Chrome(options=options, browser_executable_path=find_chrome(), version_main=chrome_major_version(), use_subprocess=True)
 
 try:
     driver.get("https://www.google.com")

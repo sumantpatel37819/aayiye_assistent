@@ -15,20 +15,15 @@ import sys
 import time
 import subprocess
 from pathlib import Path
+from gettinglinks.chrome_config import assistant_profile_dir
 
-PROFILE_DIR = str(Path(__file__).resolve().parent / "playwright_profile")
+PROFILE_DIR = str(assistant_profile_dir())
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
 def find_chrome() -> str:
-    possible_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]
-    for p in possible_paths:
-        if os.path.exists(p):
-            return p
-    return "chrome"
+    from gettinglinks.chrome_config import find_chrome as locate_chrome
+    return locate_chrome()
+
 
 def launch_login_chrome():
     chrome_path = find_chrome()
@@ -54,7 +49,7 @@ def launch_login_chrome():
     print("\n⏳ Chrome khul gaya hai. Login karne ke baad Chrome window ko band kar dijiye...")
     proc.wait()
 
-    print("\n🎉 Chrome close ho gaya! Login session aur cookies 'playwright_profile' me save ho chuki hain.")
+    print(f"\n🎉 Chrome close ho gaya! Login session save ho gaya: {PROFILE_DIR}")
     print("Ab aap aaram se apna chatbot ya sheet repair run kar sakte hain!\n")
 
 if __name__ == "__main__":

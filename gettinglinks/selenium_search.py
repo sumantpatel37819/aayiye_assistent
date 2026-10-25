@@ -1,6 +1,8 @@
 """
 selenium_search.py — Background (headless) web search and extraction using undetected_chromedriver.
 """
+from gettinglinks.chrome_config import find_chrome, chrome_major_version
+
 
 import time
 import random
@@ -26,7 +28,8 @@ def get_driver():
         try:
             _global_driver = uc.Chrome(
                 options=options, 
-                version_main=149,
+                browser_executable_path=find_chrome(),
+                version_main=chrome_major_version(),
                 use_subprocess=True
             )
         except Exception as e:

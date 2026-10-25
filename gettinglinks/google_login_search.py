@@ -26,6 +26,7 @@ import requests
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from pathlib import Path
+from gettinglinks.chrome_config import assistant_profile_dir
 
 load_dotenv()
 GMAIL_ID       = os.getenv("GMAIL_ID", "")
@@ -37,7 +38,7 @@ SERP_API_KEY   = os.getenv("SERP_API_KEY", "")
 # Dedicated playwright_profile folder -- persistent session for cookies
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PW_PROFILE_DIR = str(Path(__file__).resolve().parent.parent / "playwright_profile")
+_PW_PROFILE_DIR = str(assistant_profile_dir())
 os.makedirs(_PW_PROFILE_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,15 +356,8 @@ def _execute_page_search(page, query: str, num_results: int) -> tuple[str, bool]
 
 
 def _find_chrome_path() -> str:
-    possible_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]
-    for p in possible_paths:
-        if os.path.exists(p):
-            return p
-    return "chrome"
+    from gettinglinks.chrome_config import find_chrome as locate_chrome
+    return locate_chrome()
 
 
 def _launch_native_chrome_login():
@@ -393,7 +387,7 @@ def _launch_native_chrome_login():
     try:
         proc = subprocess.Popen(cmd)
         proc.wait()
-        print("\n  🎉 Chrome window close ho gayi! Session 'playwright_profile' me save ho gaya.\n")
+        print(f"\n  🎉 Chrome window close ho gayi! Session save ho gaya: {_PW_PROFILE_DIR}\n")
     except Exception as e:
         print(f"  [ERR] Native Chrome launch error: {e}")
 
@@ -459,7 +453,7 @@ def _browser_worker_loop():
             pw = sync_playwright().start()
             browser = pw.chromium.launch_persistent_context(
                 user_data_dir=_PW_PROFILE_DIR,
-                channel="chrome",
+                executable_path=_find_chrome_path(),
                 headless=False,
                 args=[
                     "--start-maximized",

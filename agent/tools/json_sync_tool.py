@@ -24,7 +24,9 @@ if hasattr(sys.stdout, "reconfigure"):
 # ─────────────────────────────────────────────
 # Directories
 # ─────────────────────────────────────────────
-SOURCE_DB_DIR = Path(r"E:\ProjectWebsite\tourKaro\tourKaro_reDesign\Plces_db")
+_LINUX_SOURCE = Path("/media/sonu/7FE1-F6A1/Startup/Aayiye/tourKaro_reDesign/Plces_db")
+_WIN_SOURCE   = Path(r"E:\ProjectWebsite\tourKaro\tourKaro_reDesign\Plces_db")
+SOURCE_DB_DIR = _LINUX_SOURCE if _LINUX_SOURCE.exists() else _WIN_SOURCE
 DEST_DB_DIR = Path(__file__).parent.parent.parent / "sheet_works" / "db" / "Plces_db"
 
 

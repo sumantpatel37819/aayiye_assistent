@@ -489,10 +489,16 @@ def _load_state_places(state_name: str, city_filter: str = None) -> list:
     state_d = next(iter(india.values())) if india else {}
 
     for city, city_data in state_d.items():
+        if not isinstance(city_data, dict):
+            continue
         if city_filter and city_filter.lower() not in city.lower():
             continue
         city_places = city_data.get("places", [])
+        if not isinstance(city_places, list):
+            continue
         for p in city_places:
+            if not isinstance(p, dict):
+                continue
             places.append({
                 "name":     p.get("name", ""),
                 "city":     city,

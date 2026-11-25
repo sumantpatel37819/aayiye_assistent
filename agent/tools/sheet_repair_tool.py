@@ -1,173 +1,308 @@
 """
 agent/tools/sheet_repair_tool.py
 
-This tool scans the spreadsheet for a given state, looks for empty fields or 
-fields containing negative LLM responses (e.g. "unfortunately, I don't have enough..."),
-and repairs them by running a live Google search (attempting Google login) 
-to extract Gemini AI overview + web links, then rewriting the field.
+High-accuracy spreadsheet audit and repair tool for Indian tourist places.
+Scans Google Sheets for a given state (and optional city) to detect and repair:
+  1. Negative or apologetic LLM responses ("Unfortunately...", "Nothing.", "Distance from capital not found.")
+  2. Missing, blank, or invalid coordinates (e.g. foreign coordinates outside India)
+  3. Mismatched or foreign Wikipedia links and images (e.g. Serbian towns, Pakistani dancers, Iranian parks)
+  4. Missing transport bullet points, authentic food items, or tourist descriptions
+
+Executes:
+  - Multi-tier coordinate re-resolution (JSON -> Google Places API -> Verified Wikipedia)
+  - Strict Wikipedia re-verification (clearing foreign pollution and restoring authentic Wikimedia images)
+  - Consolidated Google Live Search (1 combined search per place, session refresh, zero 3rd-party fallbacks)
+  - LLM rewriting with rigorous post-cleaning and authentic regional fallbacks
+  - Direct in-place Google Sheets row updates preserving original IDs
 """
 
+import re
+import json
 import time
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama.llms import OllamaLLM
+import random
+import socket
+from pathlib import Path
 
+# Force IPv4 resolution to prevent socket hang on Ubuntu 24.04
+_orig_getaddrinfo = socket.getaddrinfo
+def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _getaddrinfo_ipv4
+
+from dotenv import load_dotenv
 from agent.tools.sheets_tool import get_existing_places_from_sheet, update_enriched_row_in_sheet
-from agent.tools.sheet_enricher_tool import CSV_COLUMNS, _rewrite
-from gettinglinks.google_login_search import search_and_extract_gemini_and_links, close_login_driver
+from agent.tools.sheet_enricher_tool import (
+    CSV_COLUMNS,
+    NEGATIVE_PHRASES,
+    FOREIGN_COUNTRIES,
+    INDIA_LAT_MIN,
+    INDIA_LAT_MAX,
+    INDIA_LON_MIN,
+    INDIA_LON_MAX,
+    needs_repair,
+    _rewrite,
+    _resolve_coordinates,
+    _is_valid_india_coord,
+    fetch_verified_wikipedia,
+    _google_search_consolidated,
+    _load_state_places,
+    _close_active_browser
+)
 
-NEGATIVE_PHRASES = [
-    "unfortunately, i don't have enough",
-    "unfortunately, i don't have",
-    "i couldn't find any specific",
-    "no specific local food details available",
-    "no information",
-    "does not provide",
-    "not mentioned",
-    "distance from capital not found",
-    "i don't have any specific"
+load_dotenv()
+
+FIELDS_TO_REPAIR = [
+    ("Description", "description"),
+    ("Recognition", "recognition"),
+    ("culture", "culture"),
+    ("History", "history"),
+    ("Address_from_Capital", "address"),
+    ("means_of_transport", "transport"),
+    ("Famous_Dish", "food")
 ]
 
-def needs_repair(text: str) -> bool:
-    """Check if the cell content is missing or has a negative LLM response."""
-    if not text or not text.strip():
-        return True
-    
-    text_lower = text.lower()
-    for phrase in NEGATIVE_PHRASES:
-        if phrase in text_lower:
+
+def _is_foreign_or_invalid_ref(ref_url: str, title: str, pname: str = "", city: str = "", state: str = "") -> bool:
+    """Check if reference URL or title contains foreign markers, generic city/state articles, or obvious mismatches."""
+    if not ref_url and not title:
+        return False
+    combined = f"{ref_url.lower()} {title.lower()}"
+    for fc in FOREIGN_COUNTRIES:
+        if fc in combined:
             return True
+
+    from agent.tools.sheet_enricher_tool import _clean_tokens
+    import difflib
+
+    clean_p = _clean_tokens(pname)
+    clean_t = _clean_tokens(title)
+    if clean_t and clean_t.issubset({city.lower(), state.lower()}):
+        if not clean_p.issubset({city.lower(), state.lower()}):
+            return True
+
+    if pname and title:
+        overlap = len(clean_p & clean_t)
+        sim = difflib.SequenceMatcher(None, pname.lower(), title.lower()).ratio()
+        if overlap < len(clean_p) and (overlap / max(len(clean_p), 1) < 0.60 or sim < 0.75):
+            return True
+
     return False
 
+
+def _is_invalid_location_string(loc_str: str) -> bool:
+    """Check if Location string is missing, invalid, or outside India bounds."""
+    if not loc_str or not loc_str.strip():
+        return True
+    loc_lower = loc_str.strip().lower()
+    if "not found" in loc_lower or "none" in loc_lower:
+        return True
+
+    # Parse lat, lon numbers
+    nums = re.findall(r"[-+]?\d*\.\d+|\d+", loc_str)
+    if len(nums) >= 2:
+        try:
+            lat = float(nums[0])
+            lon = float(nums[1])
+            return not (INDIA_LAT_MIN <= lat <= INDIA_LAT_MAX and INDIA_LON_MIN <= lon <= INDIA_LON_MAX)
+        except ValueError:
+            return True
+    return True
+
+
 def repair_state_places(state_name: str, city_name: str | None = None) -> str:
-    """Scans and repairs missing/negative data in the state's Google Sheet.
+    """Scans and repairs missing, broken, or negative data in the state's Google Sheet.
     
     Args:
-        state_name: State jiska data repair karna hai (e.g., "Bihar").
-        city_name: Agar sirf ek city ka data repair karna ho (e.g., "Patna").
-                   None ya falsy value hone par poore state ka data repair hoga.
+        state_name (str): State jiska data repair karna hai (e.g., 'Bihar', 'Uttarakhand').
+        city_name (str | None): Optional city filter (e.g., 'Patna'). If None, scans entire state tab.
+        
+    Returns:
+        str: Detailed summary of repaired places and updated rows.
     """
-    
     from agent.task_controller import task_controller
 
     city_filter = city_name.strip().lower() if city_name else None
+    display_target = f"{state_name}" + (f" ({city_name})" if city_name else "")
+    print(f"\n🔍 [Sheet Repair] Starting deep audit for: {display_target}")
 
-    if city_filter:
-        print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name}, city: {city_name}")
-    else:
-        print(f"\n🔍 [Sheet Repair] Starting scan for state: {state_name} (all cities)")
-    
     existing_places = get_existing_places_from_sheet(state_name.title())
-    
     if not existing_places:
-        return f"No existing places found in the sheet for {state_name}."
+        return f"No existing places found in the Google Sheet for '{state_name}'."
 
-    task_controller.reset(f"Repairing {state_name}" + (f" ({city_name})" if city_filter else ""), len(existing_places))
-
-    fields_to_check = {
-        "Description": "tourist description and importance",
-        "Recognition": "official recognition and significance",
-        "culture": "local culture and traditions",
-        "Address_from_Capital": "distance and route from state capital",
-        "means_of_transport": "how to reach by train, bus, road",
-        "Famous_Dish": "famous local food and dishes",
-        "History": "historical significance and background"
-    }
-    
-    repaired_count = 0
-    total_count = len(existing_places)
-    
+    # Load local JSON places for coordinate/metadata reference if available
+    local_places_map = {}
     try:
-        # existing_places is a dict: { "place_name_lower": { "row_index": X, "data": [...] } }
-        processed_rows = set()
-        for idx, (place_lower, info) in enumerate(existing_places.items(), start=1):
-            row_idx = info["row_index"]
-            if row_idx in processed_rows:
-                continue
-            processed_rows.add(row_idx)
+        raw_local = _load_state_places(state_name)
+        for lp in raw_local:
+            lp_name = lp.get("name", "").strip().lower()
+            if lp_name:
+                local_places_map[lp_name] = lp
+    except Exception as e:
+        print(f"  ℹ Notice: Local JSON places could not be loaded ({e}). Will rely on API and web.")
 
-            row_data = info["data"]
-            
-            # Reconstruct the row dict for easier manipulation
+    # Deduplicate rows by row_index
+    unique_rows = {}
+    for place_key, info in existing_places.items():
+        r_idx = info["row_index"]
+        if r_idx not in unique_rows:
+            unique_rows[r_idx] = info["data"]
+
+    sorted_row_indices = sorted(unique_rows.keys())
+    total_rows = len(sorted_row_indices)
+    task_controller.reset(f"Repairing {display_target}", total_rows)
+
+    repaired_count = 0
+    scanned_count = 0
+
+    try:
+        for idx_num, row_idx in enumerate(sorted_row_indices, start=1):
+            row_data = unique_rows[row_idx]
+
+            # Reconstruct row_dict
             row_dict = {}
             for i, col in enumerate(CSV_COLUMNS):
                 row_dict[col] = row_data[i].strip() if i < len(row_data) else ""
-            
-            pname = row_dict.get("famous_place_name") or row_dict.get("Place") or place_lower.title()
 
-            # ── City filter ───────────────────────────────────
+            pname = row_dict.get("famous_place_name") or row_dict.get("Place") or ""
+            city = (row_dict.get("district") or row_dict.get("Place") or "").strip().title()
+
+            if not pname:
+                continue
+
+            # Apply city filter if provided
             if city_filter:
-                row_city = (row_dict.get("district") or row_dict.get("Place") or row_dict.get("City") or "").strip().lower()
+                row_city = city.lower()
                 if not (city_filter in row_city or (row_city and row_city in city_filter)):
-                    continue  # Is place ka city match nahi kiya — skip karo
-            # ─────────────────────────────────────────────────
-            if not task_controller.check_point(idx, total_count, pname, f"Repairing {state_name}"):
+                    continue
+
+            scanned_count += 1
+            if not task_controller.check_point(idx_num, total_rows, pname, f"Repairing {display_target}"):
                 print("  ⏹ Repair task stopped by user.")
                 break
-            
-            needs_update = False
-            
-            # Check each field
-            for field, query_context in fields_to_check.items():
-                cell_value = row_dict.get(field, "")
-                
-                if needs_repair(cell_value):
-                    print(f"\n  🛠 Repairing [{field}] for '{pname}'...")
-                    print(f"    Current value: '{cell_value[:50]}...'")
-                    
-                    # 1. Search Google with Gemini
-                    query = f"{pname} {state_name} {query_context}"
-                    print(f"    🔍 Searching: '{query}'")
-                    raw_extracted_text = search_and_extract_gemini_and_links(query, num_results=2)
-                    
-                    # 2. Rewrite
-                    if raw_extracted_text:
-                        # Assuming the _rewrite from enricher handles prompts based on field name, but lowercase it
-                        prompt_field_map = {
-                            "Description": "description",
-                            "Recognition": "recognition",
-                            "culture": "culture",
-                            "Address_from_Capital": "address",
-                            "means_of_transport": "transport",
-                            "Famous_Dish": "food",
-                            "History": "history"
-                        }
-                        
-                        rewrite_field = prompt_field_map.get(field, "description")
-                        new_text = _rewrite(rewrite_field, raw_extracted_text, pname, state_name)
-                        
-                        if new_text and not needs_repair(new_text):
-                            print(f"    ✅ Repaired [{field}] -> {len(new_text)} chars")
-                            row_dict[field] = new_text
-                            needs_update = True
-                        else:
-                            print(f"    ⚠ LLM could not repair the text properly.")
+
+            print(f"\n  [{idx_num}/{total_rows}] Auditing: {pname} ({city}, {state_name})")
+
+            row_needs_update = False
+            reasons = []
+
+            # ── 1. Audit Coordinates ─────────────────────────────────────
+            curr_loc = row_dict.get("Location", "")
+            if _is_invalid_location_string(curr_loc):
+                print(f"    📍 Bad/Missing coordinates detected: '{curr_loc}' -> Re-resolving...")
+                local_meta = local_places_map.get(pname.lower(), {})
+                new_loc = _resolve_coordinates(
+                    pname, city, state_name,
+                    json_lat=local_meta.get("lat"),
+                    json_lon=local_meta.get("lon")
+                )
+                if new_loc != curr_loc:
+                    row_dict["Location"] = new_loc
+                    row_needs_update = True
+                    reasons.append("coordinates")
+                    print(f"    ✅ Repaired Location: {new_loc}")
+
+            # ── 2. Audit Wikipedia Reference, Title & Images ─────────────
+            curr_ref = row_dict.get("reference", "")
+            curr_title = row_dict.get("famous_place_title", "")
+            curr_img = row_dict.get("Image URL from wikipedia", "")
+
+            is_bad_ref = _is_foreign_or_invalid_ref(curr_ref, curr_title, pname=pname, city=city, state=state_name)
+            is_missing_img = not curr_img.strip()
+
+            wiki_data = None
+            if is_bad_ref or is_missing_img:
+                if is_bad_ref:
+                    print(f"    ❌ Mismatched/Foreign reference detected: '{curr_ref}' (Title: '{curr_title}')")
+                else:
+                    print(f"    🖼️ Wikipedia images missing for: '{pname}'")
+
+                wiki_data = fetch_verified_wikipedia(pname, city, state_name)
+                if wiki_data.get("wiki_url"):
+                    if curr_ref != wiki_data["wiki_url"]:
+                        row_dict["reference"] = wiki_data["wiki_url"]
+                        row_dict["famous_place_title"] = wiki_data["title"]
+                        row_needs_update = True
+                        reasons.append("wikipedia_reference")
+
+                    if wiki_data.get("images"):
+                        new_img_str = ", ".join(wiki_data["images"][:8])
+                        if curr_img != new_img_str:
+                            row_dict["Image URL from wikipedia"] = new_img_str
+                            row_needs_update = True
+                            reasons.append("wikipedia_images")
+                            print(f"    ✅ Attached {len(wiki_data['images'])} verified Wikimedia images.")
+                else:
+                    # Not verified: clear any corrupted reference / wrong images
+                    if is_bad_ref:
+                        row_dict["reference"] = ""
+                        row_dict["famous_place_title"] = pname
+                        row_dict["Image URL from wikipedia"] = ""
+                        row_needs_update = True
+                        reasons.append("cleared_bad_wikipedia")
+                        print(f"    🧹 Cleared corrupted foreign reference for: '{pname}'")
+
+            # ── 3. Audit Text Fields ──────────────────────────────────────
+            broken_fields = []
+            for col_name, field_key in FIELDS_TO_REPAIR:
+                val = row_dict.get(col_name, "")
+                if needs_repair(val):
+                    broken_fields.append((col_name, field_key, val))
+
+            if broken_fields:
+                print(f"    🛠 Broken/Negative text fields detected: {[bf[0] for bf in broken_fields]}")
+                broken_keys = [bf[1] for bf in broken_fields]
+                has_wiki = bool(wiki_data and wiki_data.get("extract") and len(wiki_data["extract"]) > 150)
+                need_hist_cult = (not has_wiki) or any(k in broken_keys for k in ["history", "culture", "recognition", "description"])
+                google_text, google_urls = _google_search_consolidated(pname, city, state_name, need_history_culture=need_hist_cult)
+
+                combined_context = ""
+                if wiki_data and wiki_data.get("extract"):
+                    combined_context += wiki_data["extract"] + "\n\n"
+                combined_context += google_text
+
+                local_meta = local_places_map.get(pname.lower(), {})
+                if not combined_context.strip() and local_meta.get("description"):
+                    combined_context = local_meta["description"]
+
+                # Append any new Google URLs
+                existing_urls = [u.strip() for u in row_dict.get("Google Search Links", "").splitlines() if u.strip()]
+                for gu in google_urls:
+                    if gu not in existing_urls:
+                        existing_urls.append(gu)
+                if existing_urls:
+                    row_dict["Google Search Links"] = "\n".join(existing_urls)
+
+                for col_name, field_key, old_val in broken_fields:
+                    print(f"      ✍ Repairing [{col_name}]...")
+                    repaired_text = _rewrite(field_key, combined_context, pname, city, state_name)
+                    if repaired_text and not needs_repair(repaired_text):
+                        row_dict[col_name] = repaired_text
+                        row_needs_update = True
+                        reasons.append(col_name)
                     else:
-                        print(f"    ⚠ No text extracted from Google for '{pname}'.")
-            
-            if needs_update:
-                # Update sheet
+                        print(f"      ⚠ Could not generate valid content for {col_name}")
+
+            # ── 4. Apply In-Place Sheet Update ───────────────────────────
+            if row_needs_update:
                 flat_row = [row_dict.get(col, "") for col in CSV_COLUMNS]
-                # Ensure ID is preserved
-                flat_row[0] = row_data[0] if row_data else ""
-                
-                print(f"  ⬆ Updating Google Sheet row {row_idx} for '{pname}'...")
+                flat_row[0] = row_data[0] if row_data else str(row_idx - 1)
+
+                print(f"    ⬆ Updating Google Sheet row {row_idx} ({', '.join(reasons)})...")
                 res_msg = update_enriched_row_in_sheet(state_name.title(), row_idx, flat_row)
-                print(f"  ✅ {res_msg}")
+                print(f"    ✅ {res_msg}")
                 repaired_count += 1
-                
-                # Sleep briefly to avoid Google Sheets API rate limits
-                time.sleep(1.5)
-                
+                time.sleep(1.5)  # Avoid Google Sheets API quota limits
+            else:
+                print(f"    ✨ Row {row_idx} is already pristine. No repairs needed.")
+
     except Exception as e:
-        print(f"\n❌ Error during repair process: {e}")
+        print(f"\n❌ Unexpected error during repair process: {e}")
     finally:
-        print("🛑 Closing browser (if open)...")
-        close_login_driver()
-        
-    return f"Repair process completed for {state_name}. Updated {repaired_count} rows."
+        print("🛑 Resetting browser session...")
+        _close_active_browser()
+
+    return f"Sheet repair completed for {display_target}. Audited {scanned_count} rows, successfully repaired {repaired_count} rows."
+
 
 if __name__ == "__main__":
-    # Test run
-    # res = repair_state_places("Bihar")
-    # print(res)
     pass

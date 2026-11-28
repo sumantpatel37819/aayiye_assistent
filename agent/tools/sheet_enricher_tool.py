@@ -28,6 +28,7 @@ def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 socket.getaddrinfo = _getaddrinfo_ipv4
 
+import psutil
 import requests
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -35,6 +36,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama.llms import OllamaLLM
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from gettinglinks.chrome_config import find_chrome, chrome_major_version
 
 load_dotenv()
@@ -449,10 +454,11 @@ def fetch_verified_wikipedia(place_name: str, city: str, state: str) -> dict:
         "wiki_url": ""
     }
 
+    clean_p = re.sub(r"[()]", " ", place_name).strip()
     search_queries = [
-        f"{place_name} {city} {state}",
-        f"{place_name} {state}",
-        place_name
+        f"{clean_p} {city} {state}",
+        f"{clean_p} {state}",
+        clean_p
     ]
 
     verified_title = ""
@@ -468,7 +474,7 @@ def fetch_verified_wikipedia(place_name: str, city: str, state: str) -> dict:
                 "utf8": 1,
                 "srlimit": 3
             }
-            resp = requests.get(WIKI_SEARCH, params=params, headers=HEADERS, timeout=10)
+            resp = requests.get(WIKI_SEARCH, params=params, headers=HEADERS, timeout=15)
             if resp.status_code != 200:
                 continue
             data = resp.json()
@@ -566,6 +572,83 @@ _active_driver = None
 BRAVE_BINARY = "/usr/bin/brave-browser" if os.path.exists("/usr/bin/brave-browser") else None
 
 
+def _kill_process_tree(pid: int):
+    """Forcefully kill a process and all of its child processes."""
+    try:
+        parent = psutil.Process(pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        parent.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+
+def _force_kill_driver(drv):
+    """Cleanly quits and forcefully terminates all associated browser processes."""
+    if not drv:
+        return
+    pids_to_kill = []
+    try:
+        if hasattr(drv, "browser_pid") and drv.browser_pid:
+            pids_to_kill.append(drv.browser_pid)
+    except Exception:
+        pass
+    try:
+        if hasattr(drv, "service") and drv.service and hasattr(drv.service, "process") and drv.service.process:
+            pids_to_kill.append(drv.service.process.pid)
+    except Exception:
+        pass
+
+    try:
+        drv.quit()
+    except Exception:
+        pass
+
+    for pid in pids_to_kill:
+        _kill_process_tree(pid)
+
+
+def _create_driver(browser_name: str):
+    """Safely initializes undetected_chromedriver for either Chrome or Brave with cached driver."""
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-search-engine-choice-screen")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+
+    target_bin = find_chrome()
+    version_main = chrome_major_version()
+
+    cached_driver = Path.home() / ".local/share/undetected_chromedriver/undetected_chromedriver"
+    driver_path = str(cached_driver) if cached_driver.exists() and cached_driver.is_file() else None
+
+    if browser_name == "brave" and BRAVE_BINARY:
+        print(f"🌐 [Browser Manager] Starting active session with BRAVE BROWSER ({BRAVE_BINARY})...")
+        options.binary_location = BRAVE_BINARY
+        target_bin = BRAVE_BINARY
+        options.add_argument("--disable-brave-update")
+        options.add_argument("--disable-features=BraveNews,BraveRewards,BraveWallet")
+    else:
+        print(f"🌐 [Browser Manager] Starting active session with GOOGLE CHROME ({target_bin})...")
+
+    kwargs = {
+        "options": options,
+        "browser_executable_path": target_bin,
+        "version_main": version_main,
+        "use_subprocess": True
+    }
+    if driver_path:
+        kwargs["driver_executable_path"] = driver_path
+
+    return uc.Chrome(**kwargs)
+
+
 def _get_active_driver():
     """Returns the currently active browser driver (Chrome or Brave), starting it if needed."""
     global _active_driver, _active_browser_name
@@ -574,47 +657,22 @@ def _get_active_driver():
             _ = _active_driver.title
             return _active_driver
         except Exception:
+            _force_kill_driver(_active_driver)
             _active_driver = None
 
-    options = uc.ChromeOptions()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-
-    target_bin = find_chrome()
-    version_main = chrome_major_version()
-
-    if _active_browser_name == "brave" and BRAVE_BINARY:
-        print(f"🌐 [Browser Manager] Starting active session with BRAVE BROWSER ({BRAVE_BINARY})...")
-        options.binary_location = BRAVE_BINARY
-        target_bin = BRAVE_BINARY
-    else:
-        _active_browser_name = "chrome"
-        print(f"🌐 [Browser Manager] Starting active session with GOOGLE CHROME ({target_bin})...")
-
     try:
-        _active_driver = uc.Chrome(
-            options=options,
-            browser_executable_path=target_bin,
-            version_main=version_main,
-            use_subprocess=True
-        )
+        _active_driver = _create_driver(_active_browser_name)
     except Exception as e:
         print(f"❌ Failed to launch {_active_browser_name.upper()} driver: {e}")
-        # Try alternate browser immediately
-        _active_browser_name = "brave" if _active_browser_name == "chrome" and BRAVE_BINARY else "chrome"
-        print(f"🔄 Retrying with {_active_browser_name.upper()}...")
-        if _active_browser_name == "brave" and BRAVE_BINARY:
-            options.binary_location = BRAVE_BINARY
-            target_bin = BRAVE_BINARY
-        else:
-            options.binary_location = None
-            target_bin = find_chrome()
-        _active_driver = uc.Chrome(
-            options=options,
-            browser_executable_path=target_bin,
-            version_main=version_main,
-            use_subprocess=True
-        )
+        # Try alternate browser immediately with clean options
+        alt_browser = "brave" if _active_browser_name == "chrome" and BRAVE_BINARY else "chrome"
+        print(f"🔄 Retrying with {alt_browser.upper()}...")
+        try:
+            _active_driver = _create_driver(alt_browser)
+            _active_browser_name = alt_browser
+        except Exception as alt_e:
+            print(f"❌ Failed to launch {alt_browser.upper()} driver as well: {alt_e}")
+            _active_driver = None
 
     return _active_driver
 
@@ -624,10 +682,7 @@ def _switch_browser():
     global _active_driver, _active_browser_name
     old_b = _active_browser_name
     if _active_driver is not None:
-        try:
-            _active_driver.quit()
-        except Exception:
-            pass
+        _force_kill_driver(_active_driver)
         _active_driver = None
 
     if old_b == "chrome" and BRAVE_BINARY:
@@ -644,16 +699,111 @@ def _close_active_browser():
     global _active_driver
     if _active_driver is not None:
         print(f"🛑 Closing {_active_browser_name.upper()} browser session...")
-        try:
-            _active_driver.quit()
-        except Exception:
-            pass
+        _force_kill_driver(_active_driver)
         _active_driver = None
+
+
+def _handle_google_interstitials(drv) -> bool:
+    """
+    Detects Google 'Verifying your request' or consent pages and uses ActionChains
+    to simulate a realistic human cursor movement and click on 'Continue'.
+    """
+    try:
+        page_src = drv.page_source.lower()
+        if "verifying your request" in page_src or "before you continue" in page_src:
+            print("    🛡️ Detected Google verification interstitial ('Verifying your request')...")
+            time.sleep(random.uniform(1.2, 2.0))
+
+            btn_selectors = [
+                "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+                "//input[@type='submit' and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+                "//div[@role='button'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+                "button#L2AGLb",
+                "//button[contains(., 'I agree')]"
+            ]
+
+            target_btn = None
+            for sel in btn_selectors:
+                elements = drv.find_elements(By.XPATH, sel)
+                for el in elements:
+                    if el.is_displayed() and el.is_enabled():
+                        target_btn = el
+                        break
+                if target_btn:
+                    break
+
+            if target_btn:
+                print("    🖱️ Simulating human cursor movement & click on [Continue]...")
+                actions = ActionChains(drv)
+                actions.move_to_element(target_btn)
+                actions.pause(random.uniform(0.4, 0.8))  # Human hesitation pause
+                actions.click_and_hold(target_btn)
+                actions.pause(random.uniform(0.08, 0.15)) # Natural click hold duration
+                actions.release()
+                actions.perform()
+                time.sleep(random.uniform(2.5, 3.5))
+                return True
+            else:
+                time.sleep(random.uniform(2.0, 3.0))
+                return True
+    except Exception as e:
+        print(f"    ⚠ Notice during interstitial handling: {e}")
+    return False
+
+
+def _search_google_human_typed(drv, query: str):
+    """
+    Simulates a human search: navigates to Google, clicks search box, types
+    keystroke-by-keystroke with natural delays, and presses Enter.
+    """
+    curr_url = drv.current_url.lower()
+    if "google.com" not in curr_url or "sorry" in curr_url or "verifying your request" in drv.page_source.lower():
+        drv.get("https://www.google.com?hl=en&gl=in")
+        time.sleep(random.uniform(1.5, 2.2))
+        _handle_google_interstitials(drv)
+
+    search_box = None
+    try:
+        search_box = WebDriverWait(drv, 6).until(
+            EC.element_to_be_clickable((By.NAME, "q"))
+        )
+    except Exception:
+        drv.get("https://www.google.com?hl=en&gl=in")
+        time.sleep(random.uniform(1.5, 2.2))
+        _handle_google_interstitials(drv)
+        search_box = WebDriverWait(drv, 6).until(
+            EC.element_to_be_clickable((By.NAME, "q"))
+        )
+
+    # Click search box naturally
+    actions = ActionChains(drv)
+    actions.move_to_element(search_box)
+    actions.pause(random.uniform(0.2, 0.4))
+    actions.click()
+    actions.perform()
+    time.sleep(0.2)
+
+    # Clear any leftover query
+    search_box.send_keys(Keys.CONTROL + "a")
+    search_box.send_keys(Keys.BACKSPACE)
+    time.sleep(random.uniform(0.1, 0.2))
+
+    # Type character-by-character
+    for char in query:
+        search_box.send_keys(char)
+        time.sleep(random.uniform(0.015, 0.045))
+
+    time.sleep(random.uniform(0.3, 0.5))
+    search_box.send_keys(Keys.RETURN)
+    time.sleep(random.uniform(2.2, 3.2))
+
+    # Handle interstitial if shown after search
+    _handle_google_interstitials(drv)
 
 
 def _execute_google_query(query: str) -> tuple[list[str], list[str]]:
     """
-    Executes a single search query on Google via the currently active browser.
+    Executes a search query on Google using human-typed interaction and cursor click handling.
     Extracts search snippets and top result URLs.
     Handles bot detection failover to the other browser.
     """
@@ -668,11 +818,10 @@ def _execute_google_query(query: str) -> tuple[list[str], list[str]]:
                 _switch_browser()
                 continue
 
-            search_url = "https://www.google.com/search?q=" + urllib.parse.quote(query) + "&hl=en&gl=in"
-            drv.get(search_url)
-            time.sleep(random.uniform(2.2, 3.2))
+            # Human-like typing search
+            _search_google_human_typed(drv, query)
 
-            # Detect Google bot block
+            # Detect Google bot hard block
             curr_url = drv.current_url.lower()
             if "sorry/index" in curr_url or "captcha" in curr_url:
                 print(f"    ⚠️ {_active_browser_name.upper()} hit Google Sorry/CAPTCHA block on attempt {attempt}!")
